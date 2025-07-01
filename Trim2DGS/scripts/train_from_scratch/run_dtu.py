@@ -1,5 +1,5 @@
-# training script for MipNeRF360 dataset
-# adapted from https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/scripts/run_mipnerf360.py
+# training script for DTU dataset
+# adapted from https://github.com/autonomousvision/gaussian-opacity-fields/blob/main/scripts/run_dtu.py
 
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -7,25 +7,24 @@ import subprocess
 import time
 import torch
 
-scenes = ["bicycle", "bonsai", "counter", "flowers", "garden", "stump", "treehill", "kitchen", "room"]
+scenes = ['scan24', 'scan37', 'scan40', 'scan55', 'scan63', 'scan65', 'scan69', 'scan83', 'scan97', 'scan105', 'scan106', 'scan110', 'scan114', 'scan118', 'scan122']
 
-factors = [4, 2, 2, 4, 4, 4, 4, 2, 2]
+factors = [2] * len(scenes)
 
 excluded_gpus = set([])
 
-output_dir = "output/MipNeRF360_2DGS"
-tune_output_dir = f"output/MipNeRF360_Trim2DGS"
-iteration = 7000
-split = "scale"
+output_dir = "output/DTU_Trim2DGS"
+iteration = 30000
 
 jobs = list(zip(scenes, factors))
 
 def train_scene(gpu, scene, factor):
+    scan_id = scene[4:]
     cmds = [
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train.py -s data/MipNeRF360/{scene} -m {output_dir}/{scene} --eval -i images_{factor} --test_iterations -1 --quiet",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python tune.py -s data/MipNeRF360/{scene} -m {tune_output_dir}/{scene} --eval -i images_{factor} --pretrained_ply {output_dir}/{scene}/point_cloud/iteration_30000/point_cloud.ply --test_iterations -1 --quiet --split {split} --max_screen_size 100",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py --iteration {iteration} -m {tune_output_dir}/{scene} --quiet --eval --skip_train",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python metrics.py -m {tune_output_dir}/{scene}",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train_TrimGS.py -s data/dtu_dataset/DTU/{scene} -m {output_dir}/{scene} --quiet --test_iterations -1 --depth_ratio 1.0 -r {factor} --lambda_dist 1000 --split mix --contribution_prune_interval 100",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py -s data/dtu_dataset/DTU/{scene} -m {output_dir}/{scene} --quiet --skip_train --depth_ratio 1.0 --num_cluster 1 --iteration {iteration} --voxel_size 0.004 --voxel_size 0.004 --sdf_trunc 0.016 --depth_trunc 3.0",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python scripts/eval_dtu/evaluate_single_scene.py --input_mesh {output_dir}/{scene}/train/ours_{iteration}/fuse_post.ply --scan_id {scan_id} --output_dir {output_dir}/{scene}/train/ours_{iteration} --mask_dir data/dtu_dataset/DTU --DTU data/dtu_dataset/Official_DTU_Dataset",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python scripts/eval_dtu_pcd/evaluate_single_scene.py --input_pcd {output_dir}/{scene}/point_cloud/iteration_{iteration}/point_cloud.ply --scan_id {scan_id} --output_dir {output_dir}/{scene}/train/ours_{iteration} --mask_dir data/dtu_dataset/DTU --DTU data/dtu_dataset/Official_DTU_Dataset",
         ]
 
     for cmd in cmds:

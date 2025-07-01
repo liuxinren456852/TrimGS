@@ -13,19 +13,16 @@ factors = [4, 2, 2, 4, 4, 4, 4, 2, 2]
 
 excluded_gpus = set([])
 
-output_dir = "output/MipNeRF360_2DGS"
-tune_output_dir = f"output/MipNeRF360_Trim2DGS"
-iteration = 7000
-split = "scale"
+output_dir = "output/MipNeRF360_Trim2DGS"
+iteration = 30000
 
 jobs = list(zip(scenes, factors))
 
 def train_scene(gpu, scene, factor):
     cmds = [
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train.py -s data/MipNeRF360/{scene} -m {output_dir}/{scene} --eval -i images_{factor} --test_iterations -1 --quiet",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python tune.py -s data/MipNeRF360/{scene} -m {tune_output_dir}/{scene} --eval -i images_{factor} --pretrained_ply {output_dir}/{scene}/point_cloud/iteration_30000/point_cloud.ply --test_iterations -1 --quiet --split {split} --max_screen_size 100",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py --iteration {iteration} -m {tune_output_dir}/{scene} --quiet --eval --skip_train",
-            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python metrics.py -m {tune_output_dir}/{scene}",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python train_TrimGS.py -s data/MipNeRF360/{scene} -m {output_dir}/{scene} --eval -i images_{factor} --test_iterations -1 --quiet --split mix",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python render.py --iteration {iteration} -m {output_dir}/{scene} --quiet --eval --skip_train --skip_mesh",
+            f"OMP_NUM_THREADS=4 CUDA_VISIBLE_DEVICES={gpu} python metrics.py -m {output_dir}/{scene}",
         ]
 
     for cmd in cmds:

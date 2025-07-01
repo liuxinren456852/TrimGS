@@ -22,7 +22,7 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, FinetuneParams
+from arguments import ModelParams, PipelineParams, TrimGSOptimizationParams
 import logging
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -86,7 +86,7 @@ def prune_low_contribution_gaussians(gaussians, cameras, pipe, bg, K=5, prune_ra
     gaussians.prune_points(prune_mask)
     torch.cuda.empty_cache()
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, pretrained_ply, split):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, split):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     model_params = "\n".join([f'{k}: {v}' for k, v in vars(dataset).items()])
@@ -96,7 +96,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     pipe_params = "\n".join([f'{k}: {v}' for k, v in vars(pipe).items()])
     logging.info(f"Pipeline params:\n{pipe_params}")
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, pretrained_ply_path=pretrained_ply)
+    scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -123,8 +123,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        # if iteration % 1000 == 0:
-        #     gaussians.oneupSHdegree()
+        if iteration % 1000 == 0:
+            gaussians.oneupSHdegree()
 
         # Pick a random Camera
         if not viewpoint_stack:
@@ -139,8 +139,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
 
         # regularization
-        lambda_normal = opt.lambda_normal
-        lambda_dist = opt.lambda_dist
+        lambda_normal = opt.lambda_normal if iteration > 7000 else 0.0
+        lambda_dist = opt.lambda_dist if iteration > 3000 else 0.0
 
         rend_dist = render_pkg["rend_dist"]
         rend_normal  = render_pkg['rend_normal']
@@ -204,6 +204,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                logging.info(f"[ITER {iteration}] reg_loss: {Ll1.item()} total_loss: {loss.item()} total_points: {scene.gaussians.get_xyz.shape[0]}")
 
 
             # Densification
@@ -220,7 +221,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.densify_and_scale_split(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, opt.max_screen_size, opt.densify_scale_factor, scene_mask, N=3, no_grad=True)
 
                     elif split == "mix":
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, opt.max_screen_size)
+                        grads = gaussians.xyz_gradient_accum / gaussians.denom
+                        grads[grads.isnan()] = 0.0
+                        gaussians.densify_and_clone(grads, opt.densify_grad_threshold, scene.cameras_extent)
+                        gaussians.densify_and_split(grads, opt.densify_grad_threshold, scene.cameras_extent)
                         scene_mask, scene_center = culling(gaussians.get_xyz, scene.getTrainCameras())
                         gaussians.densify_and_scale_split(opt.densify_grad_threshold, opt.opacity_cull, scene.cameras_extent, opt.max_screen_size, opt.densify_scale_factor, scene_mask, N=3, no_grad=True)
 
@@ -228,9 +232,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         pass
                     else:
                         raise ValueError(f"Unknown split type {split}")
-                    if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
-                        prune_low_contribution_gaussians(gaussians, all_cameras, pipe, background, K=5, prune_ratio=opt.contribution_prune_ratio)
-                        print(f'Num gs after contribution prune: {len(gaussians.get_xyz)}')
+
+                if iteration > opt.contribution_prune_from_iter and iteration % opt.contribution_prune_interval == 0:
+                    prune_low_contribution_gaussians(gaussians, all_cameras, pipe, background, K=5, prune_ratio=opt.contribution_prune_ratio)
+                    print(f'Num gs after contribution prune: {len(gaussians.get_xyz)}')
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -258,7 +263,7 @@ def prepare_output_and_logger(args):
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
-    logging.basicConfig(filename=os.path.join(args.model_path, "training.log"), level=logging.INFO)
+    logging.basicConfig(filename=os.path.join(args.model_path, "training.log"), level=logging.INFO, format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
     # Create Tensorboard writer
     tb_writer = None
     if TENSORBOARD_FOUND:
@@ -331,7 +336,7 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
-    op = FinetuneParams(parser)
+    op = TrimGSOptimizationParams(parser)
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
@@ -341,7 +346,6 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--pretrained_ply", type=str, default = None)
     parser.add_argument("--split", type=str, default = "mix")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -354,7 +358,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.pretrained_ply, args.split)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.split)
 
     # All done
     print("\nTraining complete.")
